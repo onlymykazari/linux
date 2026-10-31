@@ -5775,6 +5775,26 @@ static inline int ufshcd_transfer_rsp_status(struct ufs_hba *hba,
 			ocs = OCS_SUCCESS;
 	}
 
+	/*
+	 * Some controller/device combinations report OCS_MISMATCH_RESP_UPIU_SIZE
+	 * for a well-formed Response UPIU, e.g. when the device answers with
+	 * TASK SET FULL flow control using a response length that differs from
+	 * the value programmed in the SQE. If the response UPIU in the UCD is
+	 * complete and belongs to this request, process it instead of failing
+	 * the command: the SAM status it carries (e.g. TASK SET FULL ->
+	 * BLK_STS_DEV_RESOURCE) is the SCSI midlayer's queue depth limiting
+	 * path, whereas mapping such completions to DID_ERROR breaks flow
+	 * control and surfaces as spurious I/O errors after retry churn.
+	 */
+	if (ocs == OCS_MISMATCH_RESP_UPIU_SIZE &&
+	    lrbp->ucd_rsp_ptr->header.transaction_code == UPIU_TRANSACTION_RESPONSE &&
+	    lrbp->ucd_rsp_ptr->header.task_tag == tag) {
+		dev_warn_ratelimited(hba->dev,
+			"OCS_MISMATCH_RESP_UPIU_SIZE with a well-formed response UPIU (tag %d), processing it\n",
+			tag);
+		ocs = OCS_SUCCESS;
+	}
+
 	switch (ocs) {
 	case OCS_SUCCESS:
 		hba->ufs_stats.last_hibern8_exit_tstamp = ktime_set(0, 0);
