@@ -5495,7 +5495,7 @@ static void ufshcd_lu_init(struct ufs_hba *hba, struct scsi_device *sdev)
 {
 	int len = QUERY_DESC_MAX_SIZE;
 	u8 lun = ufshcd_scsi_to_upiu_lun(sdev->lun);
-	u8 lun_qdepth = 0;
+	u8 lun_qdepth = hba->nutrs;
 	u8 *desc_buf;
 	int ret;
 
@@ -5518,13 +5518,6 @@ static void ufshcd_lu_init(struct ufs_hba *hba, struct scsi_device *sdev)
 		 * use the smaller between UFSHCI CAP.NUTRS and UFS LU bLUQueueDepth
 		 */
 		lun_qdepth = min_t(int, desc_buf[UNIT_DESC_PARAM_LU_Q_DEPTH], hba->nutrs);
-	} else if (hba->dev_info.bqueuedepth) {
-		/*
-		 * In shared queueing architecture, bLUQueueDepth is 0 and the
-		 * device-wide bQueueDepth bounds the commands outstanding to the
-		 * whole device at any time, so the LU must not exceed it either.
-		 */
-		lun_qdepth = min_t(int, hba->dev_info.bqueuedepth, hba->nutrs);
 	}
 	/*
 	 * According to UFS device specification, the write protection mode is only supported by
@@ -5571,11 +5564,10 @@ set_qdepth:
 	 * For WLUNs that don't support unit descriptor, queue depth is set to 1.
 	 * For LUs whose bLUQueueDepth == 0, use the UFS device-wide queue depth
 	 * when valid; some firmware reports a working global bQueueDepth while
-	 * leaving the unit descriptor field zero. When neither is available,
-	 * fall back to the full host queue depth.
+	 * leaving the unit descriptor field zero.
 	 */
-	if (!lun_qdepth)
-		lun_qdepth = hba->nutrs;
+	if (!lun_qdepth && hba->dev_info.bqueuedepth)
+		lun_qdepth = hba->dev_info.bqueuedepth;
 	dev_dbg(hba->dev, "Set LU %x queue depth %d\n", lun, lun_qdepth);
 	scsi_change_queue_depth(sdev, lun_qdepth);
 }
@@ -5776,21 +5768,25 @@ static inline int ufshcd_transfer_rsp_status(struct ufs_hba *hba,
 	}
 
 	/*
-	 * Some controller/device combinations report OCS_MISMATCH_RESP_UPIU_SIZE
-	 * for a well-formed Response UPIU, e.g. when the device answers with
-	 * TASK SET FULL flow control using a response length that differs from
-	 * the value programmed in the SQE. If the response UPIU in the UCD is
-	 * complete and belongs to this request, process it instead of failing
-	 * the command: the SAM status it carries (e.g. TASK SET FULL ->
-	 * BLK_STS_DEV_RESOURCE) is the SCSI midlayer's queue depth limiting
-	 * path, whereas mapping such completions to DID_ERROR breaks flow
-	 * control and surfaces as spurious I/O errors after retry churn.
+	 * Some controller/device combinations complete a valid Response UPIU
+	 * with OCS_MISMATCH_RESP_UPIU_SIZE: the device answers commands beyond
+	 * its queue capacity with TASK SET FULL flow control, and the
+	 * controller flags that response as a size mismatch instead of
+	 * delivering it with OCS_SUCCESS. Recover the completion only when the
+	 * response in the UCD verifiably is that flow-control answer - a
+	 * Response UPIU for this task tag carrying TASK SET FULL, the only
+	 * status ever observed under this OCS. Everything else keeps the
+	 * DID_ERROR path below, so the controller error is never silently
+	 * ignored. Handing the status to the SCSI midlayer restores the
+	 * queue-depth limiting that DID_ERROR bypasses (TASK SET FULL ->
+	 * BLK_STS_DEV_RESOURCE -> scsi_track_queue_full()).
 	 */
 	if (ocs == OCS_MISMATCH_RESP_UPIU_SIZE &&
 	    lrbp->ucd_rsp_ptr->header.transaction_code == UPIU_TRANSACTION_RESPONSE &&
-	    lrbp->ucd_rsp_ptr->header.task_tag == tag) {
+	    lrbp->ucd_rsp_ptr->header.task_tag == tag &&
+	    lrbp->ucd_rsp_ptr->header.status == SAM_STAT_TASK_SET_FULL) {
 		dev_warn_ratelimited(hba->dev,
-			"OCS_MISMATCH_RESP_UPIU_SIZE with a well-formed response UPIU (tag %d), processing it\n",
+			"OCS_MISMATCH_RESP_UPIU_SIZE carries TASK SET FULL (tag %d), processing flow control\n",
 			tag);
 		ocs = OCS_SUCCESS;
 	}

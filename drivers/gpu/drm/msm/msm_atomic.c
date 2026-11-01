@@ -206,6 +206,12 @@ static bool msm_atomic_is_seamless_mode_switch(
 		    !old_crtc_state->enable || !new_crtc_state->enable)
 			return false;
 
+		if (drm_mode_equal(&old_crtc_state->adjusted_mode,
+				   &new_crtc_state->adjusted_mode) &&
+		    old_crtc_state->mode.hdisplay == new_crtc_state->mode.hdisplay &&
+		    old_crtc_state->mode.vdisplay == new_crtc_state->mode.vdisplay)
+			return false;
+
 		for_each_oldnew_connector_in_state(state, connector,
 						   old_conn_state,
 						   new_conn_state, j) {
@@ -244,6 +250,21 @@ static void msm_atomic_disable_timing_db(struct drm_atomic_commit *state)
 
 		msm_dsi_manager_disable_timing_db(new_conn_state->best_encoder);
 	}
+}
+
+static bool msm_atomic_mode_switch_failed(struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *new_conn_state;
+	struct drm_connector *connector;
+	int i;
+
+	for_each_new_connector_in_state(state, connector, new_conn_state, i) {
+		if (new_conn_state->best_encoder &&
+		    msm_dsi_manager_mode_switch_failed(new_conn_state->best_encoder))
+			return true;
+	}
+
+	return false;
 }
 
 int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
@@ -314,9 +335,13 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 		drm_atomic_helper_update_legacy_modeset_state(dev, state);
 		drm_atomic_helper_calc_timestamping_constants(state);
 		drm_atomic_helper_commit_crtc_set_mode(dev, state);
-	} else {
-		drm_atomic_helper_commit_modeset_disables(dev, state);
+		if (msm_atomic_mode_switch_failed(state)) {
+			drm_warn(dev, "Seamless mode switch failed, retrying full modeset\n");
+			seamless = false;
+		}
 	}
+	if (!seamless)
+		drm_atomic_helper_commit_modeset_disables(dev, state);
 	drm_atomic_helper_commit_planes(dev, state, 0);
 	if (!seamless)
 		drm_atomic_helper_commit_modeset_enables(dev, state);

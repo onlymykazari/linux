@@ -6,8 +6,11 @@
  * Copyright (c) 2025, 2026 Junjie Cao <caojunjie650@gmail.com>
  */
 
+#include <linux/align.h>
+#include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/device-id/of.h>
+#include <linux/devm-helpers.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -24,10 +27,15 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 
 struct nt36532 {
 	struct drm_panel panel;
 	struct drm_connector *connector;
+	struct drm_crtc *backlight_crtc;
+	struct backlight_device *backlight;
+	struct work_struct backlight_work;
+	bool backlight_pending;
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_info *panel_info;
 	struct drm_dsc_config dsc;
@@ -89,6 +97,10 @@ static int nt36532_prepare(struct drm_panel *panel)
 	struct nt36532 *ctx = to_nt36532(panel);
 	int ret;
 
+	ret = backlight_disable(ctx->backlight);
+	if (ret)
+		return ret;
+
 	ret = regulator_bulk_enable(ARRAY_SIZE(nt36532_supplies),
 				    ctx->supplies);
 	if (ret < 0)
@@ -103,6 +115,76 @@ static int nt36532_prepare(struct drm_panel *panel)
 				       ctx->supplies);
 		return ret;
 	}
+
+	return 0;
+}
+
+static void nt36532_backlight_work(struct work_struct *work)
+{
+	struct nt36532 *ctx = container_of(work, struct nt36532, backlight_work);
+	struct drm_crtc *crtc = ctx->backlight_crtc;
+	struct device *dev = &ctx->dsi[0]->dev;
+	u64 first_vblank;
+	long completed;
+	int ret;
+
+	ret = drm_crtc_vblank_get(crtc);
+	if (ret)
+		goto error;
+
+	first_vblank = drm_crtc_vblank_count(crtc);
+	completed = wait_event_timeout(*drm_crtc_vblank_waitqueue(crtc),
+			!READ_ONCE(ctx->backlight_pending) ||
+			drm_crtc_vblank_count(crtc) - first_vblank >= 2,
+			msecs_to_jiffies(250));
+	drm_crtc_vblank_put(crtc);
+
+	if (!READ_ONCE(ctx->backlight_pending))
+		return;
+	if (!completed) {
+		ret = -ETIMEDOUT;
+		goto error;
+	}
+
+	ret = backlight_enable(ctx->backlight);
+	if (!ret)
+		return;
+
+	backlight_disable(ctx->backlight);
+error:
+	dev_err(dev, "Failed to enable backlight after first frame: %d\n", ret);
+}
+
+static int nt36532_enable(struct drm_panel *panel)
+{
+	struct nt36532 *ctx = to_nt36532(panel);
+
+	if (!ctx->backlight)
+		return 0;
+	if (!ctx->connector || !ctx->connector->state ||
+	    !ctx->connector->state->crtc)
+		return -ENODEV;
+
+	ctx->backlight_crtc = ctx->connector->state->crtc;
+	WRITE_ONCE(ctx->backlight_pending, true);
+	schedule_work(&ctx->backlight_work);
+
+	return 0;
+}
+
+static int nt36532_disable(struct drm_panel *panel)
+{
+	struct nt36532 *ctx = to_nt36532(panel);
+	int ret;
+
+	WRITE_ONCE(ctx->backlight_pending, false);
+	if (ctx->backlight_crtc)
+		wake_up_all(drm_crtc_vblank_waitqueue(ctx->backlight_crtc));
+	cancel_work_sync(&ctx->backlight_work);
+
+	ret = backlight_disable(ctx->backlight);
+	if (ret)
+		dev_err(&ctx->dsi[0]->dev, "Failed to disable backlight: %d\n", ret);
 
 	return 0;
 }
@@ -142,7 +224,31 @@ static int nt36532_get_modes(struct drm_panel *panel,
 	struct nt36532 *ctx = to_nt36532(panel);
 	const struct panel_info *panel_info = ctx->panel_info;
 	struct drm_display_mode *mode;
-	unsigned int i;
+	static const struct nt36532_scaled_size {
+		unsigned int width;
+		unsigned int height;
+	} scaled_sizes[] = {
+		{ 2560, 1600 },
+		{ 2560, 1440 },
+		{ 2400, 1696 },
+		{ 2100, 1484 },
+		{ 2048, 1536 },
+		{ 1920, 1200 },
+		{ 1920, 1080 },
+		{ 1800, 1272 },
+		{ 1680, 1050 },
+		{ 1600, 1200 },
+		{ 1600, 900 },
+		{ 1500, 1060 },
+		{ 1280, 960 },
+		{ 1280, 800 },
+		{ 1280, 720 },
+		{ 1200, 848 },
+		{ 1024, 768 },
+	};
+	static const unsigned int scaled_refresh_rates[] = { 60, 120 };
+	unsigned int i, refresh;
+	int count = 0;
 
 	ctx->connector = connector;
 
@@ -158,13 +264,30 @@ static int nt36532_get_modes(struct drm_panel *panel,
 
 		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(scaled_sizes); i++) {
+		for (refresh = 0; refresh < ARRAY_SIZE(scaled_refresh_rates); refresh++) {
+			mode = drm_cvt_mode(connector->dev, ALIGN(scaled_sizes[i].width, 8),
+					    scaled_sizes[i].height,
+					    scaled_refresh_rates[refresh], true, false, false);
+			if (!mode)
+				return -ENOMEM;
+
+			mode->hdisplay = scaled_sizes[i].width;
+			drm_mode_set_name(mode);
+			mode->type = DRM_MODE_TYPE_DRIVER;
+			drm_mode_probed_add(connector, mode);
+			count++;
+		}
 	}
 
 	connector->display_info.bpc = 8;
 	connector->display_info.width_mm = panel_info->modes[0].mode.width_mm;
 	connector->display_info.height_mm = panel_info->modes[0].mode.height_mm;
 
-	return panel_info->num_modes;
+	return count;
 }
 
 static int nt36532_find_mode(struct nt36532 *ctx,
@@ -235,6 +358,8 @@ static int nt36532_mode_switch(struct drm_panel *panel,
 
 static const struct drm_panel_funcs nt36532_panel_funcs = {
 	.prepare = nt36532_prepare,
+	.enable = nt36532_enable,
+	.disable = nt36532_disable,
 	.unprepare = nt36532_unprepare,
 	.get_modes = nt36532_get_modes,
 	.mode_switch_is_seamless = nt36532_mode_switch_is_seamless,
@@ -497,9 +622,19 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 
 	ctx->panel.prepare_prev_first = true;
 
-	ret = drm_panel_of_backlight(&ctx->panel);
+	ctx->backlight = devm_of_find_backlight(dev);
+	if (IS_ERR(ctx->backlight))
+		return dev_err_probe(dev, PTR_ERR(ctx->backlight),
+				     "Failed to get backlight\n");
+
+	ret = backlight_disable(ctx->backlight);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to get backlight\n");
+		return dev_err_probe(dev, ret, "Failed to disable backlight\n");
+
+	ret = devm_work_autocancel(dev, &ctx->backlight_work,
+				  nt36532_backlight_work);
+	if (ret)
+		return ret;
 
 	ret = devm_drm_panel_add(dev, &ctx->panel);
 	if (ret < 0)
@@ -518,6 +653,14 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	}
 
 	return 0;
+}
+
+static void nt36532_remove(struct mipi_dsi_device *dsi)
+{
+	struct nt36532 *ctx = mipi_dsi_get_drvdata(dsi);
+
+	drm_panel_disable(&ctx->panel);
+	drm_panel_unprepare(&ctx->panel);
 }
 
 static const struct panel_info csot_panel_info = {
@@ -540,6 +683,7 @@ MODULE_DEVICE_TABLE(of, nt36532_of_match);
 
 static struct mipi_dsi_driver nt36532_driver = {
 	.probe = nt36532_probe,
+	.remove = nt36532_remove,
 	.driver = {
 		.name = "panel-novatek-nt36532",
 		.of_match_table = nt36532_of_match,
