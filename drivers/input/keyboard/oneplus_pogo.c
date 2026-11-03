@@ -11,15 +11,19 @@
  */
 
 #include <linux/gpio/consumer.h>
+#include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
+#include <linux/hex.h>
 #include <linux/kstrtox.h>
+#include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/serdev.h>
+#include <linux/sysfs.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
@@ -38,15 +42,23 @@
 #define POGO_CMD_HEARTBEAT		0x2f
 #define POGO_CMD_USER_GENERAL		0x3a
 #define POGO_CMD_USER_GENERAL_ACK	0x3b
+#define POGO_SYNC_POWER_ON		0x01
+#define POGO_SYNC_HEARTBEAT		0x05
+#define POGO_SYNC_NFC_NEAR		0x07
+#define POGO_SYNC_NFC_FAR		0x08
+#define POGO_SYNC_NFC_NEAR_MAGIC	0xe0
+#define POGO_SYNC_NFC_FAR_MAGIC		0xe1
 
 #define POGO_PARAM_LED			0x0d
 #define POGO_GENERAL_HOST_SLEEP		0x02
 #define POGO_GENERAL_TOUCHPAD_DISABLE	0x11
+#define POGO_GENERAL_NFC_ENABLE		0x06
+#define POGO_GENERAL_NFC_DATA		0x07
 #define POGO_TOUCHPAD_RESTORE_TRIES	1
 #define POGO_TOUCHPAD_RESTORE_DELAY_MS	5
 #define POGO_DISCONNECT_TIMEOUT_MS	2000
 #define POGO_TX_SYNC_COUNT		8
-#define POGO_TX_FRAME_MAX		32
+#define POGO_TX_FRAME_MAX		(POGO_TX_SYNC_COUNT + 5 + POGO_MAX_PAYLOAD + 2 + 1 + 4)
 
 #define POGO_CRC_INIT			0xc596
 #define POGO_MAX_PAYLOAD		255
@@ -137,6 +149,7 @@ struct oneplus_pogo {
 	struct delayed_work setup_work;
 	struct delayed_work touchpad_work;
 	struct delayed_work presence_work;
+	struct work_struct nfc_work;
 	/* Serializes receive parsing with touchpad state changes. */
 	struct mutex lock;
 	/* Serializes half-duplex UART transmissions without blocking RX parsing. */
@@ -166,6 +179,9 @@ struct oneplus_pogo {
 	bool tx_ready;
 	bool attached;
 	bool touchpad_target_enabled;
+	bool nfc_present;
+	bool mac_valid;
+	u8 mac[6];
 	u8 touchpad_restore_left;
 };
 
@@ -629,6 +645,44 @@ static void oneplus_pogo_presence_work(struct work_struct *work)
 	mutex_unlock(&pogo->lock);
 }
 
+static void oneplus_pogo_nfc_work(struct work_struct *work)
+{
+	struct oneplus_pogo *pogo = container_of(work, struct oneplus_pogo,
+						 nfc_work);
+	char *envp[] = { "NFC_PRESENT=0", NULL };
+
+	if (READ_ONCE(pogo->nfc_present))
+		envp[0] = "NFC_PRESENT=1";
+	sysfs_notify(&pogo->serdev->dev.kobj, NULL, "nfc_present");
+	kobject_uevent_env(&pogo->serdev->dev.kobj, KOBJ_CHANGE, envp);
+}
+
+/* Caller holds pogo->lock. */
+static void oneplus_pogo_set_nfc_present(struct oneplus_pogo *pogo,
+					 bool present)
+{
+	if (pogo->nfc_present == present)
+		return;
+
+	pogo->nfc_present = present;
+	dev_info(&pogo->serdev->dev, "NFC field %s\n",
+		 present ? "detected" : "lost");
+	queue_work(system_dfl_wq, &pogo->nfc_work);
+}
+
+/* Caller holds pogo->lock.  The wire carries the BLE address LSB first. */
+static void oneplus_pogo_set_mac(struct oneplus_pogo *pogo, const u8 *mac)
+{
+	if (pogo->mac_valid && !memcmp(pogo->mac, mac, sizeof(pogo->mac)))
+		return;
+
+	memcpy(pogo->mac, mac, sizeof(pogo->mac));
+	pogo->mac_valid = true;
+	dev_info(&pogo->serdev->dev,
+		 "keyboard BLE address %02x:%02x:%02x:%02x:%02x:%02x\n",
+		 mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+}
+
 static void oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 {
 	const u8 *payload;
@@ -690,25 +744,38 @@ static void oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 	case POGO_CMD_HEARTBEAT:
 		/*
 		 * Oplus power-on (sub-command 0x01) and heartbeat (0x05)
-		 * packets carry the persistent touchpad-disable state after the
-		 * keyboard identity and MAC address.
+		 * packets carry the brand byte, the keyboard BLE address and the
+		 * persistent touchpad-disable state.  Sub-commands 0x07/0x08
+		 * announce an NFC field appearing at or leaving the keyboard tag.
 		 */
-		if (payload_len > 9 && payload[0] == 0x01 &&
-		    payload[1] == 0x02)
+		if (payload_len > 9 && payload[0] == POGO_SYNC_POWER_ON &&
+		    payload[1] == 0x02) {
+			oneplus_pogo_set_mac(pogo, payload + 3);
 			pogo->touchpad_disabled = !!payload[9];
-		else if (payload_len > 10 && payload[0] == 0x05 &&
-			 payload[1] == 0x02)
+		} else if (payload_len > 10 && payload[0] == POGO_SYNC_HEARTBEAT &&
+			   payload[1] == 0x02) {
+			oneplus_pogo_set_mac(pogo, payload + 4);
 			pogo->touchpad_disabled = !!payload[10];
+		} else if (payload_len >= 2 && payload[0] == POGO_SYNC_NFC_NEAR &&
+			   payload[1] == POGO_SYNC_NFC_NEAR_MAGIC) {
+			oneplus_pogo_set_nfc_present(pogo, true);
+		} else if (payload_len >= 2 && payload[0] == POGO_SYNC_NFC_FAR &&
+			   payload[1] == POGO_SYNC_NFC_FAR_MAGIC) {
+			oneplus_pogo_set_nfc_present(pogo, false);
+		}
 		break;
 	case POGO_CMD_USER_GENERAL_ACK:
+		dev_info_ratelimited(&pogo->serdev->dev, "general ack: %*ph\n",
+				     min_t(int, payload_len, 64), payload);
 		/* Touchpad-status response: sub-command, length, state. */
 		if (payload_len >= 3 && payload[0] == 0x0c &&
 		    payload[1] >= 1)
 			pogo->touchpad_disabled = !!payload[2];
 		break;
 	default:
-		dev_dbg_ratelimited(&pogo->serdev->dev,
-				    "unhandled command 0x%02x\n", command);
+		dev_info_ratelimited(&pogo->serdev->dev,
+				     "unhandled command 0x%02x: %*ph\n", command,
+				     min_t(int, payload_len, 64), payload);
 		break;
 	}
 }
@@ -850,9 +917,92 @@ static ssize_t attached_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(attached);
 
+static ssize_t nfc_present_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct serdev_device *serdev = to_serdev_device(dev);
+	struct oneplus_pogo *pogo = serdev_device_get_drvdata(serdev);
+	bool present;
+
+	if (!pogo)
+		return -ENODEV;
+
+	mutex_lock(&pogo->lock);
+	present = pogo->nfc_present;
+	mutex_unlock(&pogo->lock);
+
+	return sysfs_emit(buf, "%u\n", present);
+}
+static DEVICE_ATTR_RO(nfc_present);
+
+static ssize_t keyboard_mac_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct serdev_device *serdev = to_serdev_device(dev);
+	struct oneplus_pogo *pogo = serdev_device_get_drvdata(serdev);
+	u8 mac[6];
+	bool valid;
+
+	if (!pogo)
+		return -ENODEV;
+
+	mutex_lock(&pogo->lock);
+	valid = pogo->mac_valid;
+	memcpy(mac, pogo->mac, sizeof(mac));
+	mutex_unlock(&pogo->lock);
+	if (!valid)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%02x:%02x:%02x:%02x:%02x:%02x\n",
+			  mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+}
+static DEVICE_ATTR_RO(keyboard_mac);
+
+/* Hex bytes: command first, then the payload, e.g. "3a 06 01 01". */
+static ssize_t raw_tx_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct serdev_device *serdev = to_serdev_device(dev);
+	struct oneplus_pogo *pogo = serdev_device_get_drvdata(serdev);
+	u8 bytes[1 + POGO_MAX_PAYLOAD];
+	char hex[2 * sizeof(bytes) + 1];
+	size_t i, n = 0;
+	int ret;
+
+	if (!pogo)
+		return -ENODEV;
+
+	for (i = 0; i < count; i++) {
+		if (isxdigit(buf[i])) {
+			if (n >= sizeof(hex) - 1)
+				return -EMSGSIZE;
+			hex[n++] = buf[i];
+		} else if (!isspace(buf[i]) && buf[i] != ':' && buf[i] != ',') {
+			return -EINVAL;
+		}
+	}
+	if (n < 2 || n % 2)
+		return -EINVAL;
+	hex[n] = '\0';
+
+	ret = hex2bin(bytes, hex, n / 2);
+	if (ret)
+		return ret;
+
+	ret = oneplus_pogo_send(pogo, bytes[0], bytes + 1, n / 2 - 1);
+	if (ret)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_WO(raw_tx);
+
 static struct attribute *oneplus_pogo_attrs[] = {
 	&dev_attr_attached.attr,
 	&dev_attr_touchpad_enabled.attr,
+	&dev_attr_nfc_present.attr,
+	&dev_attr_keyboard_mac.attr,
+	&dev_attr_raw_tx.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(oneplus_pogo);
@@ -954,6 +1104,7 @@ static int oneplus_pogo_probe(struct serdev_device *serdev)
 	mutex_init(&pogo->lock);
 	mutex_init(&pogo->tx_lock);
 	INIT_WORK(&pogo->led_work, oneplus_pogo_led_work);
+	INIT_WORK(&pogo->nfc_work, oneplus_pogo_nfc_work);
 	INIT_DELAYED_WORK(&pogo->setup_work, oneplus_pogo_setup_work);
 	INIT_DELAYED_WORK(&pogo->touchpad_work, oneplus_pogo_touchpad_work);
 	INIT_DELAYED_WORK(&pogo->presence_work, oneplus_pogo_presence_work);
@@ -1066,6 +1217,7 @@ static void oneplus_pogo_remove(struct serdev_device *serdev)
 
 	WRITE_ONCE(pogo->tx_ready, false);
 	cancel_work_sync(&pogo->led_work);
+	cancel_work_sync(&pogo->nfc_work);
 	devm_release_action(&serdev->dev, oneplus_pogo_stop_delayed_work, pogo);
 	cancel_delayed_work_sync(&pogo->setup_work);
 	if (pogo->power_gpio)
